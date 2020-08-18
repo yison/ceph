@@ -4080,7 +4080,7 @@ std::vector<Option> get_global_options() {
     .set_long_description("If running multiple SPDK instances per node, you must specify the amount of dpdk memory size in MB each instance will use, to make sure each instance uses its own dpdk memory"),
 
     Option("bluestore_spdk_coremask", Option::TYPE_STR, Option::LEVEL_DEV)
-    .set_default("0x1")
+    .set_default("0x3")
     .set_description("A hexadecimal bit mask of the cores to run on. Note the core numbering can change between platforms and should be determined beforehand"),
 
     Option("bluestore_spdk_max_io_completion", Option::TYPE_UINT, Option::LEVEL_DEV)
