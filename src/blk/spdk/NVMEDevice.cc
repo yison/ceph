@@ -79,7 +79,6 @@ struct data_cache_buf : public bi::slist_base_hook<bi::link_mode<bi::normal_link
 struct Task;
 
 class SharedDriverQueueData {
-//   NVMEDevice *bdev;
   SharedDriverData *driver;
   spdk_nvme_ctrlr *ctrlr;
   spdk_nvme_ns *ns;
@@ -93,7 +92,6 @@ class SharedDriverQueueData {
   bool aio_stop = false;
 
   void _aio_thread();
-//   bool reap_io = false;
   int alloc_buf_from_pool(Task *t, bool write);
 
   std::atomic_bool queue_empty;
@@ -144,17 +142,12 @@ class SharedDriverQueueData {
       }
       data_buf_list.push_front(*reinterpret_cast<data_cache_buf *>(b));
     }
-
-//     bdev->queue_number++;
-//     if (bdev->queue_number.load() == 1)
-//       reap_io = true;
   }
 
   ~SharedDriverQueueData() {
     dout(1) << __func__ << "@@: ~SharedDriverQueueData" << left << dendl;
     if (qpair) {
       spdk_nvme_ctrlr_free_io_qpair(qpair);
-//       bdev->queue_number--;
     }
 
     data_buf_list.clear_and_dispose(spdk_dma_free);
@@ -302,7 +295,6 @@ struct Task {
   Task *primary = nullptr;
   ceph::coarse_real_clock::time_point start;
   IORequest io_request = {};
-//   ceph::mutex lock = ceph::make_mutex("Task::lock");
   ceph::condition_variable cond;
   SharedDriverQueueData *queue = nullptr;
   // reference count by subtasks.
@@ -586,7 +578,6 @@ class NVMEManager {
 
  private:
   ceph::mutex lock = ceph::make_mutex("NVMEManager::lock");
-  bool init = false;
   bool stopping = false;
   std::vector<SharedDriverData*> shared_driver_datas;
   std::thread dpdk_thread;
@@ -724,11 +715,6 @@ int NVMEManager::try_get(const spdk_nvme_transport_id& trid, SharedDriverData **
 
   uint32_t mem_size_arg = (uint32_t)g_conf().get_val<Option::size_t>("bluestore_spdk_mem");
 
-//   if (!init && !dpdk_thread.joinable()) {
-//     init = true;
-//   if (!dpdk_thread.joinable()) {
-//   if (!init) {
-//     init = true;  
   if (!dpdk_thread.joinable()) {
     dpdk_thread = std::thread(
       [this, coremask_arg, m_core_arg, mem_size_arg, pci_addr]() {
@@ -837,7 +823,6 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
 	  task->return_code = 0;
       }
       ctx->try_aio_wake();
-//       --ctx->num_running;
     }
   } else {
     ceph_assert(task->command == IOCommand::FLUSH_COMMAND);
