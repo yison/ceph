@@ -46,9 +46,12 @@
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_bdev
 #undef dout_prefix
-#define dout_prefix *_dout << "bdev(" << sn << ") "
+#define dout_prefix *_dout << "bdev"
 
-static constexpr uint16_t data_buffer_default_num = 1024;
+// static constexpr uint16_t data_buffer_default_num = 1024;
+// static constexpr uint16_t data_buffer_default_num = 2048;
+// static constexpr uint16_t data_buffer_default_num = 8192;
+static constexpr uint16_t data_buffer_default_num = 16384;
 
 static constexpr uint32_t data_buffer_size = 8192;
 
@@ -82,7 +85,6 @@ class SharedDriverQueueData {
   SharedDriverData *driver;
   spdk_nvme_ctrlr *ctrlr;
   spdk_nvme_ns *ns;
-  std::string sn;
   uint32_t block_size;
   uint32_t core_id;
   uint32_t queue_id;
@@ -106,6 +108,7 @@ class SharedDriverQueueData {
 
   public:
     uint32_t current_queue_depth = 0;
+    // TODO: queue_op_seq, completed_op_seq will overflow!!!
     std::atomic_ulong completed_op_seq, queue_op_seq;
     bi::slist<data_cache_buf, bi::constant_time_size<true>> data_buf_list;
     void _aio_handle(Task *t, IOContext *ioc);
@@ -124,7 +127,7 @@ class SharedDriverQueueData {
         completed_op_seq(0),
         queue_op_seq(0) {
 
-    dout(1) << __func__ << "@@: SharedDriverQueueData" << left << dendl;
+    dout(1) << __func__ << "@@: SharedDriverQueueData queue_id=" << queue_id << dendl;
     struct spdk_nvme_io_qpair_opts opts = {};
     spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &opts, sizeof(opts));
     opts.qprio = SPDK_NVME_QPRIO_URGENT;
@@ -145,7 +148,7 @@ class SharedDriverQueueData {
   }
 
   ~SharedDriverQueueData() {
-    dout(1) << __func__ << "@@: ~SharedDriverQueueData" << left << dendl;
+    dout(1) << __func__ << "@@: ~SharedDriverQueueData" << dendl;
     if (qpair) {
       spdk_nvme_ctrlr_free_io_qpair(qpair);
     }
@@ -153,15 +156,7 @@ class SharedDriverQueueData {
     data_buf_list.clear_and_dispose(spdk_dma_free);
   }
 
-  void queue_task(Task *t, uint64_t ops = 1) {
-    queue_op_seq += ops;
-    std::lock_guard l(queue_lock);
-    task_queue.push(t);
-    if (queue_empty.load()) {
-      queue_empty = false;
-      queue_cond.notify_all();
-    }
-  }
+  void queue_task(Task *t, uint64_t ops = 1);
 
   void flush_wait() {
     uint64_t cur_seq = queue_op_seq.load();
@@ -252,6 +247,14 @@ class SharedDriverData {
   }
 
   SharedDriverQueueData *get_queue(uint32_t i) {
+//     dout(1) << __func__ << "@1 i=" << i
+//                         << " queue_number="
+//                         << queue_number
+//                         << " i % queue_number="
+//                         << i%queue_number
+//                         << " queues.size="
+//                         << queues.size()
+//                         << dendl;
     return queues.at(i % queue_number);
   }
 
@@ -402,6 +405,16 @@ static int data_buf_next_sge(void *cb_arg, void **address, uint32_t *length)
   return 0;
 }
 
+void SharedDriverQueueData::queue_task(Task *t, uint64_t ops) {
+  queue_op_seq += ops;
+  std::lock_guard l(queue_lock);
+  task_queue.push(t);
+  if (queue_empty.load()) {
+    queue_empty = false;
+    queue_cond.notify_all();
+  }
+}
+
 int SharedDriverQueueData::alloc_buf_from_pool(Task *t, bool write)
 {
   uint64_t count = t->len / data_buffer_size;
@@ -452,6 +465,7 @@ void SharedDriverQueueData::_aio_thread()
  again:
     dout(40) << __func__ << " polling" << dendl;
     if (inflight) {
+//       dout(1) << __func__ << " spdk_nvme_qpair_process_completions" << dendl;
       r = spdk_nvme_qpair_process_completions(qpair, max_io_completion);
       if (r < 0) {
         ceph_abort();
@@ -460,6 +474,7 @@ void SharedDriverQueueData::_aio_thread()
 
     for (; t; t = t->next) {
       if (current_queue_depth == max_queue_depth) {
+        dout(1) << __func__ << " @3 no slots!" << dendl;
         // no slots
         goto again;
       }
@@ -473,6 +488,7 @@ void SharedDriverQueueData::_aio_thread()
           dout(20) << __func__ << " write command issued " << lba_off << "~" << lba_count << dendl;
           r = alloc_buf_from_pool(t, true);
           if (r < 0) {
+            dout(1) << __func__ << " @2 alloc_buf_from_pool failed!" << dendl;
             goto again;
           }
 
@@ -525,12 +541,26 @@ void SharedDriverQueueData::_aio_thread()
     if (!queue_empty.load()) {
       std::lock_guard l(queue_lock);
       if (!task_queue.empty()) {
-        t = task_queue.front();
-        task_queue.pop();
-        // logger->set(l_bluestore_nvmedevice_queue_ops, task_queue.size());
+        uint32_t submit_task_ops = task_queue.size();
+        Task * _t = nullptr;
+        for (uint32_t i=0; i < submit_task_ops; i++) {
+          Task * entry = task_queue.front();
+          task_queue.pop();
+          if (0 == i) {
+            t = entry;
+          } else {
+            _t->next = entry;
+          }
+          _t = static_cast<Task*>(entry->ctx->nvme_task_last);
+          entry->ctx->nvme_task_last = entry->ctx->nvme_task_first = nullptr;
+        }
+        if (_t) {
+          _t->next = nullptr;
+        }
       }
-      if (!t)
+      if (!t) {
         queue_empty = true;
+      }
     } else {
       if (flush_waiters.load()) {
         std::lock_guard l(flush_lock);
@@ -539,9 +569,11 @@ void SharedDriverQueueData::_aio_thread()
       }
 
       if (!inflight) {
+        // dout(1) << "@@@2" << dendl;
         // be careful, here we need to let each thread reap its own, currently it is done
         // by only one dedicatd dpdk thread
         if(!queue_id) {
+        //   dout(1) << "@@@3" << dendl;
           for (auto &&it : driver->registered_devices)
             it->reap_ioc();
         }
@@ -551,9 +583,11 @@ void SharedDriverQueueData::_aio_thread()
         //   cur = ceph::coarse_real_clock::now();
         //   auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(cur - start);
         //   logger->tinc(l_bluestore_nvmedevice_polling_lat, dur);
-          if (aio_stop)
+          if (aio_stop) {
             break;
+          }
           queue_cond.wait(l);
+        //   dout(1) << "@@@7" << dendl;
         //   start = ceph::coarse_real_clock::now();
         }
       }
@@ -948,10 +982,11 @@ void NVMEDevice::aio_submit(IOContext *ioc)
     ioc->num_pending -= pending;
     ceph_assert(ioc->num_pending.load() == 0);  // we should be only thread doing this
     // Only need to push the first entry
-    ioc->nvme_task_first = ioc->nvme_task_last = nullptr;
+//     ioc->nvme_task_first = ioc->nvme_task_last = nullptr;
 
     if (queue_id == -1) {
       queue_id = ceph_gettid();
+      dout(1) << "@@: queue_id=" << queue_id << dendl;
     }
     driver->get_queue(queue_id)->queue_task(t, pending);
 //     thread_local SharedDriverQueueData queue_t = SharedDriverQueueData(this, driver);
