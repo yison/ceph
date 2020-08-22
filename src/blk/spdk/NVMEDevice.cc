@@ -57,6 +57,12 @@ static constexpr uint32_t data_buffer_size = 8192;
 
 static constexpr uint16_t inline_segment_num = 32;
 
+// static constexpr uint16_t max_task_ops = 128;
+// static constexpr uint16_t max_task_ops = 512;
+// static constexpr uint16_t max_task_ops = 64;
+
+static constexpr uint32_t submit_limit = 256;
+
 static thread_local int queue_id = -1;
 
 static void io_complete(void *t, const struct spdk_nvme_cpl *completion);
@@ -184,9 +190,10 @@ class SharedDriverQueueData {
 
   void stop() {
     {
-      std::lock_guard l(queue_lock);
+      std::unique_lock l(queue_lock);
       aio_stop = true;
-      queue_cond.notify_all();
+//       queue_cond.notify_all();
+      queue_cond.wait(l);
     }
     dout(1) << __func__ << " stop thread on core id=" << core_id << dendl;
     int r = rte_eal_wait_lcore(core_id);
@@ -406,13 +413,17 @@ static int data_buf_next_sge(void *cb_arg, void **address, uint32_t *length)
 }
 
 void SharedDriverQueueData::queue_task(Task *t, uint64_t ops) {
-  queue_op_seq += ops;
+  dout(1) << __func__ << "@@@0" << dendl;
   std::lock_guard l(queue_lock);
   task_queue.push(t);
-  if (queue_empty.load()) {
-    queue_empty = false;
-    queue_cond.notify_all();
-  }
+  queue_op_seq += ops;
+//   if (queue_empty.load()) {
+//     dout(1) << __func__ << "@@@0 set queue_empty=false" << dendl;
+//     queue_empty = false;
+//     dout(1) << __func__ << "@@@0 notify" << dendl;
+//     queue_cond.notify_all();
+//   }
+  dout(1) << __func__ << "@@@0 release lock" << dendl;
 }
 
 int SharedDriverQueueData::alloc_buf_from_pool(Task *t, bool write)
@@ -538,60 +549,76 @@ void SharedDriverQueueData::_aio_thread()
       }
       current_queue_depth++;
     }
-    if (!queue_empty.load()) {
+//       dout(1) << " @@@1 queue_empty=false" << dendl; 
+    std::queue<Task*> q;
+    if (!task_queue.empty()) {
       std::lock_guard l(queue_lock);
-      if (!task_queue.empty()) {
-        uint32_t submit_task_ops = task_queue.size();
-        Task * _t = nullptr;
-        for (uint32_t i=0; i < submit_task_ops; i++) {
-          Task * entry = task_queue.front();
-          task_queue.pop();
-          if (0 == i) {
-            t = entry;
-          } else {
-            _t->next = entry;
-          }
-          _t = static_cast<Task*>(entry->ctx->nvme_task_last);
-          entry->ctx->nvme_task_last = entry->ctx->nvme_task_first = nullptr;
-        }
-        if (_t) {
-          _t->next = nullptr;
-        }
+      dout(1) << __func__ << " @@ thread_id=" << queue_id
+                          << " task_queue_size=" << task_queue.size()
+                          << " current_io_queue_depth=" << current_queue_depth
+                          << " inflight_ops=" << (queue_op_seq.load() - completed_op_seq.load())
+                          << dendl;
+      while (!task_queue.empty()) {
+        Task * item = task_queue.front();
+        task_queue.pop();
+        q.push(item);
       }
-      if (!t) {
-        queue_empty = true;
+    }
+      Task * _t = nullptr;
+      int q_size = q.size();
+      for (int i=0; i < q_size; i++) {
+        Task * entry = q.front();
+        q.pop();
+        if (0 == i) {
+          t = entry;
+        } else {
+          _t->next = entry;
+        }
+        _t = static_cast<Task*>(entry->ctx->nvme_task_last);
+        entry->ctx->nvme_task_last = entry->ctx->nvme_task_first = nullptr;
       }
-    } else {
-      if (flush_waiters.load()) {
-        std::lock_guard l(flush_lock);
-        if (*flush_waiter_seqs.begin() <= completed_op_seq.load())
-          flush_cond.notify_all();
+      if (_t) {
+        _t->next = nullptr;
       }
 
+//       if (!t) {
+//         dout(1) << " @@@1 set queue_empty=true" << dendl; 
+//         queue_empty = true;
+//       }
+//       if (flush_waiters.load()) {
+//         std::lock_guard l(flush_lock);
+//         if (*flush_waiter_seqs.begin() <= completed_op_seq.load())
+//           flush_cond.notify_all();
+//       }
+
       if (!inflight) {
-        // dout(1) << "@@@2" << dendl;
+        dout(1) << "@@@2" << dendl;
         // be careful, here we need to let each thread reap its own, currently it is done
         // by only one dedicatd dpdk thread
         if(!queue_id) {
-        //   dout(1) << "@@@3" << dendl;
+          dout(1) << "@@@3" << dendl;
           for (auto &&it : driver->registered_devices)
             it->reap_ioc();
         }
 
-        std::unique_lock l(queue_lock);
-        if (queue_empty.load()) {
+        dout(1) << "@@@6 wait queue_lock" << dendl;
+        std::lock_guard l(queue_lock);
+        if (task_queue.empty()) {
+        //   dout(1) << "@@@6 queue_empty=true" << dendl;
         //   cur = ceph::coarse_real_clock::now();
         //   auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(cur - start);
         //   logger->tinc(l_bluestore_nvmedevice_polling_lat, dur);
           if (aio_stop) {
+            queue_cond.notify_all();
             break;
           }
-          queue_cond.wait(l);
+        //   dout(1) << "@@@7 wait" << dendl;
+        //   queue_cond.wait(l);
         //   dout(1) << "@@@7" << dendl;
         //   start = ceph::coarse_real_clock::now();
         }
+        // dout(1) << " @@@6 release queue_lock" << dendl;
       }
-    }
   }
   assert(data_buf_mempool.size() == data_buffer_default_num);
   dout(1) << __func__ << " end" << dendl;
@@ -825,14 +852,19 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
     // check waiting count before doing callback (which may
     // destroy this ioc).
     if (ctx->priv) {
+//       dout(20) << __func__ << "@@ cb:start" << dendl;
       if (!--ctx->num_running) {
+        // dout(20) << __func__ << "@@ cb:ctx=" << ctx << " num_running=" << ctx->num_running << dendl;
         task->device->aio_callback(task->device->aio_callback_priv, ctx->priv);
       }
+//       dout(20) << __func__ << "@@ cb:done" << dendl;
     } else {
+//       dout(20) << __func__ << " aio_wake" << dendl;
       ctx->try_aio_wake();
     }
     task->release_segs(queue);
     delete task;
+//     dout(20) << __func__ << "write done!" << dendl;
   } else if (task->command == IOCommand::READ_COMMAND) {
     ceph_assert(!spdk_nvme_cpl_is_error(completion));
     dout(20) << __func__ << " read op successfully" << dendl;
@@ -957,15 +989,15 @@ int NVMEDevice::collect_metadata(const string& prefix, map<string,string> *pm) c
 int NVMEDevice::flush()
 {
   dout(10) << __func__ << " start" << dendl;
-  auto start = ceph::coarse_real_clock::now();
+//   auto start = ceph::coarse_real_clock::now();
 
-  if(queue_id == -1)
-    queue_id = ceph_gettid();
-  SharedDriverQueueData *queue = driver->get_queue(queue_id);
-  assert(queue != NULL);
-  queue->flush_wait();
-  auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      ceph::coarse_real_clock::now() - start);
+//   if(queue_id == -1)
+//     queue_id = ceph_gettid();
+//   SharedDriverQueueData *queue = driver->get_queue(queue_id);
+//   assert(queue != NULL);
+//   queue->flush_wait();
+//   auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(
+//       ceph::coarse_real_clock::now() - start);
 //   queue->logger->tinc(l_bluestore_nvmedevice_flush_lat, dur);
   return 0;
 }
