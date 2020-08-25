@@ -414,9 +414,9 @@ static int data_buf_next_sge(void *cb_arg, void **address, uint32_t *length)
 
 void SharedDriverQueueData::queue_task(Task *t, uint64_t ops) {
   dout(1) << __func__ << "@@@0" << dendl;
+  queue_op_seq += ops;
   std::lock_guard l(queue_lock);
   task_queue.push(t);
-  queue_op_seq += ops;
 //   if (queue_empty.load()) {
 //     dout(1) << __func__ << "@@@0 set queue_empty=false" << dendl;
 //     queue_empty = false;
@@ -553,7 +553,7 @@ void SharedDriverQueueData::_aio_thread()
     std::queue<Task*> q;
     if (!task_queue.empty()) {
       std::lock_guard l(queue_lock);
-      dout(1) << __func__ << " @@ thread_id=" << queue_id
+      dout(5) << __func__ << " @@ thread_id=" << queue_id
                           << " task_queue_size=" << task_queue.size()
                           << " current_io_queue_depth=" << current_queue_depth
                           << " inflight_ops=" << (queue_op_seq.load() - completed_op_seq.load())
@@ -564,22 +564,23 @@ void SharedDriverQueueData::_aio_thread()
         q.push(item);
       }
     }
-      Task * _t = nullptr;
-      int q_size = q.size();
-      for (int i=0; i < q_size; i++) {
-        Task * entry = q.front();
-        q.pop();
-        if (0 == i) {
-          t = entry;
-        } else {
-          _t->next = entry;
-        }
-        _t = static_cast<Task*>(entry->ctx->nvme_task_last);
-        entry->ctx->nvme_task_last = entry->ctx->nvme_task_first = nullptr;
+
+    Task * _t = nullptr;
+    int q_size = q.size();
+    for (int i=0; i < q_size; i++) {
+      Task * entry = q.front();
+      q.pop();
+      if (0 == i) {
+        t = entry;
+      } else {
+        _t->next = entry;
       }
-      if (_t) {
-        _t->next = nullptr;
-      }
+      _t = static_cast<Task*>(entry->ctx->nvme_task_last);
+      entry->ctx->nvme_task_last = entry->ctx->nvme_task_first = nullptr;
+    }
+    if (_t) {
+      _t->next = nullptr;
+    }
 
 //       if (!t) {
 //         dout(1) << " @@@1 set queue_empty=true" << dendl; 
@@ -590,18 +591,18 @@ void SharedDriverQueueData::_aio_thread()
 //         if (*flush_waiter_seqs.begin() <= completed_op_seq.load())
 //           flush_cond.notify_all();
 //       }
-
+    if (!t) {
       if (!inflight) {
-        dout(1) << "@@@2" << dendl;
+        dout(5) << "@@@2" << dendl;
         // be careful, here we need to let each thread reap its own, currently it is done
         // by only one dedicatd dpdk thread
         if(!queue_id) {
-          dout(1) << "@@@3" << dendl;
+          dout(5) << "@@@3" << dendl;
           for (auto &&it : driver->registered_devices)
             it->reap_ioc();
         }
 
-        dout(1) << "@@@6 wait queue_lock" << dendl;
+        dout(5) << "@@@6 wait queue_lock" << dendl;
         std::lock_guard l(queue_lock);
         if (task_queue.empty()) {
         //   dout(1) << "@@@6 queue_empty=true" << dendl;
@@ -619,6 +620,7 @@ void SharedDriverQueueData::_aio_thread()
         }
         // dout(1) << " @@@6 release queue_lock" << dendl;
       }
+    }
   }
   assert(data_buf_mempool.size() == data_buffer_default_num);
   dout(1) << __func__ << " end" << dendl;
