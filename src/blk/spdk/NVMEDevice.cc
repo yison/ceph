@@ -118,7 +118,8 @@ class SharedDriverQueueData {
   public:
     uint32_t current_queue_depth = 0;
     // TODO: queue_op_seq, completed_op_seq will overflow!!!
-    std::atomic_ulong completed_op_seq, queue_op_seq;
+//     std::atomic_ulong completed_op_seq, queue_op_seq;
+    std::atomic_ulong inflight_ops;
     bi::slist<data_cache_buf, bi::constant_time_size<true>> data_buf_list;
     void _aio_handle(Task *t, IOContext *ioc);
 
@@ -134,8 +135,9 @@ class SharedDriverQueueData {
         queue_empty(false),
         task_queue(max_task_queue_size),
         flush_waiters(0),
-        completed_op_seq(0),
-        queue_op_seq(0) {
+        inflight_ops(0) {
+        // completed_op_seq(0),
+        // queue_op_seq(0) {
 
     dout(1) << __func__ << "@@: SharedDriverQueueData queue_id=" << queue_id << dendl;
     struct spdk_nvme_io_qpair_opts opts = {};
@@ -169,20 +171,20 @@ class SharedDriverQueueData {
   void queue_task(Task *t, uint64_t ops = 1);
 
   void flush_wait() {
-    uint64_t cur_seq = queue_op_seq.load();
-    uint64_t left = cur_seq - completed_op_seq.load();
-    if (cur_seq > completed_op_seq) {
-      // TODO: this may contains read op
-      dout(10) << __func__ << " existed inflight ops " << left << dendl;
-      std::unique_lock l{flush_lock};
-      ++flush_waiters;
-      flush_waiter_seqs.insert(cur_seq);
-      while (cur_seq > completed_op_seq.load()) {
-        flush_cond.wait(l);
-      }
-      flush_waiter_seqs.erase(cur_seq);
-      --flush_waiters;
-    }
+//     uint64_t cur_seq = queue_op_seq.load();
+//     uint64_t left = cur_seq - completed_op_seq.load();
+//     if (cur_seq > completed_op_seq) {
+//       // TODO: this may contains read op
+//       dout(10) << __func__ << " existed inflight ops " << left << dendl;
+//       std::unique_lock l{flush_lock};
+//       ++flush_waiters;
+//       flush_waiter_seqs.insert(cur_seq);
+//       while (cur_seq > completed_op_seq.load()) {
+//         flush_cond.wait(l);
+//       }
+//       flush_waiter_seqs.erase(cur_seq);
+//       --flush_waiters;
+//     }
   }
 
   void start() {
@@ -417,8 +419,8 @@ static int data_buf_next_sge(void *cb_arg, void **address, uint32_t *length)
 }
 
 void SharedDriverQueueData::queue_task(Task *t, uint64_t ops) {
-  dout(1) << __func__ << "@@@0" << dendl;
-  queue_op_seq += ops;
+//   queue_op_seq += ops;
+  inflight_ops +=ops;
 //   std::lock_guard l(queue_lock);
   task_queue.push(t);
 //   if (queue_empty.load()) {
@@ -427,7 +429,6 @@ void SharedDriverQueueData::queue_task(Task *t, uint64_t ops) {
 //     dout(1) << __func__ << "@@@0 notify" << dendl;
 //     queue_cond.notify_all();
 //   }
-  dout(1) << __func__ << "@@@0 release lock" << dendl;
 }
 
 int SharedDriverQueueData::alloc_buf_from_pool(Task *t, bool write)
@@ -476,7 +477,8 @@ void SharedDriverQueueData::_aio_thread()
   uint32_t max_io_completion = (uint32_t)g_conf().get_val<uint64_t>("bluestore_spdk_max_io_completion");
 
   while (true) {
-    bool inflight = queue_op_seq.load() - completed_op_seq.load();
+//     bool inflight = queue_op_seq.load() - completed_op_seq.load();
+    bool inflight = inflight_ops.load();
  again:
     dout(40) << __func__ << " polling" << dendl;
     if (inflight) {
@@ -602,16 +604,13 @@ void SharedDriverQueueData::_aio_thread()
 //       }
     if (!t) {
       if (!inflight) {
-        dout(5) << "@@@2" << dendl;
         // be careful, here we need to let each thread reap its own, currently it is done
         // by only one dedicatd dpdk thread
         if(!queue_id) {
-          dout(5) << "@@@3" << dendl;
           for (auto &&it : driver->registered_devices)
             it->reap_ioc();
         }
 
-        dout(5) << "@@@6 wait queue_lock" << dendl;
         std::lock_guard l(queue_lock);
         if (task_queue.empty()) {
         //   dout(1) << "@@@6 queue_empty=true" << dendl;
@@ -854,12 +853,14 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
 
   ceph_assert(queue != NULL);
   ceph_assert(ctx != NULL);
-  ++queue->completed_op_seq;
+//   ++queue->completed_op_seq;
+  --queue->inflight_ops;
   --queue->current_queue_depth;
   if (task->command == IOCommand::WRITE_COMMAND) {
     ceph_assert(!spdk_nvme_cpl_is_error(completion));
     dout(20) << __func__ << " write/zero op successfully, left "
-             << queue->queue_op_seq - queue->completed_op_seq << dendl;
+        //      << queue->queue_op_seq - queue->completed_op_seq << dendl;
+             << queue->inflight_ops << dendl;
     // check waiting count before doing callback (which may
     // destroy this ioc).
     if (ctx->priv) {
