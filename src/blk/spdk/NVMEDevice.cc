@@ -29,6 +29,7 @@
 #include <map>
 #include <thread>
 #include <boost/intrusive/slist.hpp>
+#include <boost/lockfree/queue.hpp>
 
 #include <spdk/nvme.h>
 #include <rte_lcore.h>
@@ -57,6 +58,7 @@ static constexpr uint32_t data_buffer_size = 8192;
 
 static constexpr uint16_t inline_segment_num = 32;
 
+static constexpr uint32_t max_task_queue_size = 1024;
 // static constexpr uint16_t max_task_ops = 128;
 // static constexpr uint16_t max_task_ops = 512;
 // static constexpr uint16_t max_task_ops = 64;
@@ -105,7 +107,8 @@ class SharedDriverQueueData {
   std::atomic_bool queue_empty;
   ceph::mutex queue_lock = ceph::make_mutex("SharedDriverQueueData::queue_lock");
   ceph::condition_variable queue_cond;
-  std::queue<Task*> task_queue;
+//   std::queue<Task*> task_queue;
+  boost::lockfree::queue<Task*> task_queue;
 
   ceph::mutex flush_lock = ceph::make_mutex("SharedDriverQueueData::flush_lock");
   ceph::condition_variable flush_cond;
@@ -129,6 +132,7 @@ class SharedDriverQueueData {
         queue_id(queue_id),
         run_func([this]() {_aio_thread(); }),
         queue_empty(false),
+        task_queue(max_task_queue_size),
         flush_waiters(0),
         completed_op_seq(0),
         queue_op_seq(0) {
@@ -415,7 +419,7 @@ static int data_buf_next_sge(void *cb_arg, void **address, uint32_t *length)
 void SharedDriverQueueData::queue_task(Task *t, uint64_t ops) {
   dout(1) << __func__ << "@@@0" << dendl;
   queue_op_seq += ops;
-  std::lock_guard l(queue_lock);
+//   std::lock_guard l(queue_lock);
   task_queue.push(t);
 //   if (queue_empty.load()) {
 //     dout(1) << __func__ << "@@@0 set queue_empty=false" << dendl;
@@ -551,19 +555,24 @@ void SharedDriverQueueData::_aio_thread()
     }
 //       dout(1) << " @@@1 queue_empty=false" << dendl; 
     std::queue<Task*> q;
-    if (!task_queue.empty()) {
-      std::lock_guard l(queue_lock);
-      dout(5) << __func__ << " @@ thread_id=" << queue_id
-                          << " task_queue_size=" << task_queue.size()
-                          << " current_io_queue_depth=" << current_queue_depth
-                          << " inflight_ops=" << (queue_op_seq.load() - completed_op_seq.load())
-                          << dendl;
-      while (!task_queue.empty()) {
-        Task * item = task_queue.front();
-        task_queue.pop();
+    Task * item = nullptr;
+    while (task_queue.pop(item)) {
         q.push(item);
-      }
     }
+//     if (!task_queue.empty()) {
+// //       std::lock_guard l(queue_lock);
+//       dout(5) << __func__ << " @@ thread_id=" << queue_id
+//                         //   << " task_queue_size=" << task_queue.size()
+//                           << " current_io_queue_depth=" << current_queue_depth
+//                           << " inflight_ops=" << (queue_op_seq.load() - completed_op_seq.load())
+//                           << dendl;
+//       while (!task_queue.empty()) {
+//         // Task * item = task_queue.front();
+//         Task * item;
+//         task_queue.pop(item);
+//         q.push(item);
+//       }
+//     }
 
     Task * _t = nullptr;
     int q_size = q.size();
