@@ -4091,6 +4091,10 @@ std::vector<Option> get_global_options() {
     .set_default(5)
     .set_description("Time period to wait if there is no completed I/O from polling"),
 
+    Option("bluestore_spdk_io_split_size", Option::TYPE_UINT, Option::LEVEL_DEV)
+    .set_default(131072)
+    .set_description("split IO size to NVME device"),
+
     Option("bluestore_block_path", Option::TYPE_STR, Option::LEVEL_DEV)
     .set_default("")
     .set_flag(Option::FLAG_CREATE)

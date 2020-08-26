@@ -591,6 +591,11 @@ void SharedDriverQueueData::_aio_thread()
     }
     if (_t) {
       _t->next = nullptr;
+      dout(2) << __func__ << " @@ thread_id=" << queue_id
+                        << " current_io_queue_depth=" << current_queue_depth
+                        << " submit_queue_size=" << q_size
+                        << " inflight_ops=" << inflight_ops
+                        << dendl;
     }
 
 //       if (!t) {
@@ -1061,7 +1066,8 @@ static void write_split(
   uint64_t remain_len = bl.length(), begin = 0, write_size;
   Task *t;
   // This value may need to be got from configuration later.
-  uint64_t split_size = 131072; // 128KB.
+//   uint64_t split_size = 131072; // 128KB.
+  uint64_t split_size = (uint64_t)g_conf().get_val<uint64_t>("bluestore_spdk_io_split_size");
 
   while (remain_len > 0) {
     write_size = std::min(remain_len, split_size);
@@ -1083,7 +1089,8 @@ static void make_read_tasks(
     uint64_t orig_off, uint64_t orig_len)
 {
   // This value may need to be got from configuration later.
-  uint64_t split_size = 131072; // 128KB.
+//   uint64_t split_size = 131072; // 128KB.
+  uint64_t split_size = (uint64_t)g_conf().get_val<uint64_t>("bluestore_spdk_io_split_size");
   uint64_t tmp_off = orig_off - aligned_off, remain_orig_len = orig_len;
   auto begin = aligned_off;
   const auto aligned_end = begin + aligned_len;
