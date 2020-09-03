@@ -616,21 +616,28 @@ void SharedDriverQueueData::_aio_thread()
             it->reap_ioc();
         }
 
-        std::lock_guard l(queue_lock);
-        if (task_queue.empty()) {
+        if (aio_stop) {
+          std::lock_guard l(queue_lock);
+          if (task_queue.empty()) {
+            queue_cond.notify_all();
+            break;
+          }
+        }
+        // std::lock_guard l(queue_lock);
+        // if (task_queue.empty()) {
         //   dout(1) << "@@@6 queue_empty=true" << dendl;
         //   cur = ceph::coarse_real_clock::now();
         //   auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(cur - start);
         //   logger->tinc(l_bluestore_nvmedevice_polling_lat, dur);
-          if (aio_stop) {
-            queue_cond.notify_all();
-            break;
-          }
+        //   if (aio_stop) {
+        //     queue_cond.notify_all();
+        //     break;
+        //   }
         //   dout(1) << "@@@7 wait" << dendl;
         //   queue_cond.wait(l);
         //   dout(1) << "@@@7" << dendl;
         //   start = ceph::coarse_real_clock::now();
-        }
+        // }
         // dout(1) << " @@@6 release queue_lock" << dendl;
       }
     }
