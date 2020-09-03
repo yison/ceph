@@ -10881,10 +10881,6 @@ void BlueStore::_txc_calc_cost(TransContext *txc)
   auto ios = 1 + txc->ioc.get_num_ios();
   auto cost = throttle_cost_per_io.load();
 
-#ifdef HAVE_SPDK
-  ios += txc->ioc.total_nseg;
-#endif
-
   txc->cost = ios * cost + txc->bytes;
   txc->ios = ios;
   dout(10) << __func__ << " " << txc << " cost " << txc->cost << " ("
