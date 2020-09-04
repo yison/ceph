@@ -36,6 +36,7 @@ enum class IOCommand {
 };
 
 class SharedDriverData;
+class Task;
 
 class NVMEDevice : public BlockDevice {
   /**
@@ -72,7 +73,14 @@ class NVMEDevice : public BlockDevice {
   int write(uint64_t off, bufferlist& bl, bool buffered, int write_hint = WRITE_LIFE_NOT_SET) override;
   int flush() override;
   int read_random(uint64_t off, uint64_t len, char *buf, bool buffered) override;
-
+  void write_split(
+    uint64_t off,
+    bufferlist &bl,
+    IOContext *ioc);
+  void make_read_tasks(
+    uint64_t aligned_off,
+    IOContext *ioc, char *buf, uint64_t aligned_len, Task *primary,
+    uint64_t orig_off, uint64_t orig_len);
   // for managing buffered readers/writers
   int invalidate_cache(uint64_t off, uint64_t len) override;
   int open(const string& path) override;

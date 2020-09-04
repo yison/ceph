@@ -102,10 +102,11 @@ class SharedDriverQueueData {
   bool aio_stop = false;
 
   void _aio_thread();
-  int alloc_buf_from_pool(Task *t, bool write);
+//   int alloc_buf_from_pool(Task *t, bool write);
 
   std::atomic_bool queue_empty;
   ceph::mutex queue_lock = ceph::make_mutex("SharedDriverQueueData::queue_lock");
+  ceph::mutex mem_pool_lock = ceph::make_mutex("SharedDriverQueueData::mem_pool_lock");
   ceph::condition_variable queue_cond;
 //   std::queue<Task*> task_queue;
   boost::lockfree::queue<Task*> task_queue;
@@ -169,7 +170,11 @@ class SharedDriverQueueData {
   }
 
   void queue_task(Task *t, uint64_t ops = 1);
+  int alloc_buf_from_pool(Task *t, bool write);
 
+  ceph::mutex *get_mem_pool_lock() {
+    return &mem_pool_lock;
+  }
   void flush_wait() {
 //     uint64_t cur_seq = queue_op_seq.load();
 //     uint64_t left = cur_seq - completed_op_seq.load();
@@ -304,7 +309,8 @@ struct Task {
   IOCommand command;
   uint64_t offset;
   uint64_t len;
-  bufferlist bl;
+//   bufferlist bl;
+  char * blp;
   std::function<void()> fill_cb;
   Task *next = nullptr;
   int64_t return_code;
@@ -331,15 +337,18 @@ struct Task {
     ceph_assert(!io_request.nseg);
   }
   void release_segs(SharedDriverQueueData *queue_data) {
+    ceph::mutex * pool_lock = queue_data->get_mem_pool_lock();
     if (io_request.extra_segs) {
       for (uint16_t i = 0; i < io_request.nseg; i++) {
         auto buf = reinterpret_cast<data_cache_buf *>(io_request.extra_segs[i]);
+        std::lock_guard l(*pool_lock);
         queue_data->data_buf_list.push_front(*buf);
       }
       delete io_request.extra_segs;
     } else if (io_request.nseg) {
       for (uint16_t i = 0; i < io_request.nseg; i++) {
         auto buf = reinterpret_cast<data_cache_buf *>(io_request.inline_segs[i]);
+        std::lock_guard l(*pool_lock);
         queue_data->data_buf_list.push_front(*buf);
       }
     }
@@ -437,31 +446,36 @@ int SharedDriverQueueData::alloc_buf_from_pool(Task *t, bool write)
   if (t->len % data_buffer_size)
     ++count;
   void **segs;
-  if (count > data_buf_list.size())
-    return -ENOMEM;
   if (count <= inline_segment_num) {
     segs = t->io_request.inline_segs;
   } else {
     t->io_request.extra_segs = new void*[count];
     segs = t->io_request.extra_segs;
   }
-  for (uint16_t i = 0; i < count; i++) {
-    ceph_assert(!data_buf_list.empty());
-    segs[i] = &data_buf_list.front();
-    ceph_assert(segs[i] != nullptr);
-    data_buf_list.pop_front();
+  {
+    std::lock_guard l(mem_pool_lock);
+    if (count > data_buf_list.size())
+      return -ENOMEM;
+    for (uint16_t i = 0; i < count; i++) {
+      ceph_assert(!data_buf_list.empty());
+      segs[i] = &data_buf_list.front();
+      ceph_assert(segs[i] != nullptr);
+      data_buf_list.pop_front();
+    }
   }
   t->io_request.nseg = count;
   t->ctx->total_nseg += count;
   if (write) {
-    auto blp = t->bl.begin();
+//     auto blp = t->bl.begin();
     uint32_t len = 0;
     uint16_t i = 0;
     for (; i < count - 1; ++i) {
-      blp.copy(data_buffer_size, static_cast<char*>(segs[i]));
+//       blp.copy(data_buffer_size, static_cast<char*>(segs[i]));
+      memcpy(static_cast<char*>(segs[i]), t->blp + len, data_buffer_size);
       len += data_buffer_size;
     }
-    blp.copy(t->bl.length() - len, static_cast<char*>(segs[i]));
+//     blp.copy(t->bl.length() - len, static_cast<char*>(segs[i]));
+    memcpy(static_cast<char*>(segs[i]), t->blp + len, t->len - len);
   }
 
   return 0;
@@ -503,11 +517,11 @@ void SharedDriverQueueData::_aio_thread()
         case IOCommand::WRITE_COMMAND:
         {
           dout(20) << __func__ << " write command issued " << lba_off << "~" << lba_count << dendl;
-          r = alloc_buf_from_pool(t, true);
-          if (r < 0) {
-            dout(1) << __func__ << " @2 alloc_buf_from_pool failed!" << dendl;
-            goto again;
-          }
+        //   r = alloc_buf_from_pool(t, true);
+        //   if (r < 0) {
+        //     dout(1) << __func__ << " @2 alloc_buf_from_pool failed!" << dendl;
+        //     goto again;
+        //   }
 
           r = spdk_nvme_ns_cmd_writev(
               ns, qpair, lba_off, lba_count, io_complete, t, 0,
@@ -524,10 +538,10 @@ void SharedDriverQueueData::_aio_thread()
         case IOCommand::READ_COMMAND:
         {
           dout(20) << __func__ << " read command issued " << lba_off << "~" << lba_count << dendl;
-          r = alloc_buf_from_pool(t, false);
-          if (r < 0) {
-            goto again;
-          }
+        //   r = alloc_buf_from_pool(t, false);
+        //   if (r < 0) {
+        //     goto again;
+        //   }
 
           r = spdk_nvme_ns_cmd_readv(
               ns, qpair, lba_off, lba_count, io_complete, t, 0,
@@ -1064,8 +1078,7 @@ static void ioc_append_task(IOContext *ioc, Task *t)
   ++ioc->num_pending;
 }
 
-static void write_split(
-    NVMEDevice *dev,
+void NVMEDevice::write_split(
     uint64_t off,
     bufferlist &bl,
     IOContext *ioc)
@@ -1076,21 +1089,32 @@ static void write_split(
 //   uint64_t split_size = 131072; // 128KB.
   uint64_t split_size = (uint64_t)g_conf().get_val<uint64_t>("bluestore_spdk_io_split_size");
 
+  if (bl.get_num_buffers() > 1) {
+    bl.rebuild();
+  }
   while (remain_len > 0) {
     write_size = std::min(remain_len, split_size);
-    t = new Task(dev, IOCommand::WRITE_COMMAND, off + begin, write_size);
+    t = new Task(this, IOCommand::WRITE_COMMAND, off + begin, write_size);
     // TODO: if upper layer alloc memory with known physical address,
     // we can reduce this copy
-    bl.splice(0, write_size, &t->bl);
+//     bl.splice(0, write_size, &t->bl);
+    t->blp = bl.c_str() + begin;
     remain_len -= write_size;
     t->ctx = ioc;
+
+again:
+    int r = driver->get_queue(queue_id)->alloc_buf_from_pool(t, true);
+    if (r < 0) {
+      dout(1) << __func__ << " @@1 alloc_buf_from_pool failed!" << dendl;
+      goto again;
+    }
+
     ioc_append_task(ioc, t);
     begin += write_size;
   }
 }
 
-static void make_read_tasks(
-    NVMEDevice *dev,
+void NVMEDevice::make_read_tasks(
     uint64_t aligned_off,
     IOContext *ioc, char *buf, uint64_t aligned_len, Task *primary,
     uint64_t orig_off, uint64_t orig_len)
@@ -1110,7 +1134,7 @@ static void make_read_tasks(
     if (primary && (aligned_len <= split_size)) {
       t = primary;
     } else {
-      t = new Task(dev, IOCommand::READ_COMMAND, begin, read_size, 0, primary);
+      t = new Task(this, IOCommand::READ_COMMAND, begin, read_size, 0, primary);
     }
 
     t->ctx = ioc;
@@ -1120,6 +1144,13 @@ static void make_read_tasks(
     t->fill_cb = [buf, t, tmp_off, tmp_len]  {
       t->copy_to_buf(buf, tmp_off, tmp_len);
     };
+
+again:
+    int r = driver->get_queue(queue_id)->alloc_buf_from_pool(t, false);
+    if (r < 0) {
+      dout(1) << __func__ << " @@1 alloc_buf_from_pool failed!" << dendl;
+      goto again;
+    }
 
     ioc_append_task(ioc, t);
     remain_orig_len -= tmp_len;
@@ -1140,7 +1171,8 @@ int NVMEDevice::aio_write(
            << " buffered " << buffered << dendl;
   ceph_assert(is_valid_io(off, len));
 
-  write_split(this, off, bl, ioc);
+//   write_split(this, off, bl, ioc);
+  write_split(off, bl, ioc);
   dout(5) << __func__ << " " << off << "~" << len << dendl;
 
   return 0;
@@ -1158,7 +1190,8 @@ int NVMEDevice::write(uint64_t off, bufferlist &bl, bool buffered, int write_hin
   ceph_assert(off + len <= size);
 
   IOContext ioc(cct, NULL);
-  write_split(this, off, bl, &ioc);
+//   write_split(this, off, bl, &ioc);
+  write_split(off, bl, &ioc);
   dout(5) << __func__ << " " << off << "~" << len << dendl;
   aio_submit(&ioc);
   ioc.aio_wait();
@@ -1178,7 +1211,8 @@ int NVMEDevice::read(uint64_t off, uint64_t len, bufferlist *pbl,
 
   // for sync read, need to control IOContext in itself
   IOContext read_ioc(cct, nullptr);
-  make_read_tasks(this, off, &read_ioc, buf, len, &t, off, len);
+//   make_read_tasks(this, off, &read_ioc, buf, len, &t, off, len);
+  make_read_tasks(off, &read_ioc, buf, len, &t, off, len);
   dout(5) << __func__ << " " << off << "~" << len << dendl;
   aio_submit(&read_ioc);
   read_ioc.aio_wait();
@@ -1199,7 +1233,8 @@ int NVMEDevice::aio_read(
   pbl->append(p);
   char* buf = p.c_str();
 
-  make_read_tasks(this, off, ioc, buf, len, NULL, off, len);
+//   make_read_tasks(this, off, ioc, buf, len, NULL, off, len);
+  make_read_tasks(off, ioc, buf, len, NULL, off, len);
   dout(5) << __func__ << " " << off << "~" << len << dendl;
   return 0;
 }
@@ -1217,7 +1252,8 @@ int NVMEDevice::read_random(uint64_t off, uint64_t len, char *buf, bool buffered
   IOContext ioc(g_ceph_context, nullptr);
   Task t(this, IOCommand::READ_COMMAND, aligned_off, aligned_len, 1);
 
-  make_read_tasks(this, aligned_off, &ioc, buf, aligned_len, &t, off, len);
+//   make_read_tasks(this, aligned_off, &ioc, buf, aligned_len, &t, off, len);
+  make_read_tasks(aligned_off, &ioc, buf, aligned_len, &t, off, len);
   aio_submit(&ioc);
   ioc.aio_wait();
 
