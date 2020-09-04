@@ -270,6 +270,14 @@ class SharedDriverData {
 //                         << dendl;
     return queues.at(i % queue_number);
   }
+  SharedDriverQueueData *get_queue(NVMEDevice *dev) {
+    for (uint32_t i=0; i < registered_devices.size(); i++) {
+      if (registered_devices.at(i) == dev) {
+        return queues.at(i % queue_number);
+      }
+    }
+    return queues.at(0);
+  }
 
   void register_device(NVMEDevice *device) {
     // in case of registered_devices, we stop thread now.
@@ -591,7 +599,7 @@ void SharedDriverQueueData::_aio_thread()
     }
     if (_t) {
       _t->next = nullptr;
-      dout(2) << __func__ << " @@ thread_id=" << queue_id
+      dout(10) << __func__ << " @@ thread_id=" << queue_id
                         << " current_io_queue_depth=" << current_queue_depth
                         << " submit_queue_size=" << q_size
                         << " inflight_ops=" << inflight_ops
@@ -1040,11 +1048,12 @@ void NVMEDevice::aio_submit(IOContext *ioc)
     // Only need to push the first entry
 //     ioc->nvme_task_first = ioc->nvme_task_last = nullptr;
 
-    if (queue_id == -1) {
-      queue_id = ceph_gettid();
-      dout(1) << "@@: queue_id=" << queue_id << dendl;
-    }
-    driver->get_queue(queue_id)->queue_task(t, pending);
+//     if (queue_id == -1) {
+//       queue_id = ceph_gettid();
+//       dout(1) << "@@: queue_id=" << queue_id << dendl;
+//     }
+//     driver->get_queue(queue_id)->queue_task(t, pending);
+    driver->get_queue(this)->queue_task(t, pending);
 //     thread_local SharedDriverQueueData queue_t = SharedDriverQueueData(this, driver);
 //     queue_t._aio_handle(t, ioc);
   }
