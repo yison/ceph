@@ -171,20 +171,16 @@ class SharedDriverQueueData {
   void queue_task(Task *t, uint64_t ops = 1);
 
   void flush_wait() {
-//     uint64_t cur_seq = queue_op_seq.load();
-//     uint64_t left = cur_seq - completed_op_seq.load();
-//     if (cur_seq > completed_op_seq) {
-//       // TODO: this may contains read op
-//       dout(10) << __func__ << " existed inflight ops " << left << dendl;
-//       std::unique_lock l{flush_lock};
-//       ++flush_waiters;
-//       flush_waiter_seqs.insert(cur_seq);
-//       while (cur_seq > completed_op_seq.load()) {
-//         flush_cond.wait(l);
-//       }
-//       flush_waiter_seqs.erase(cur_seq);
-//       --flush_waiters;
-//     }
+    if (inflight_ops.load() > 0) {
+      // TODO: this may contains read op
+      dout(5) << __func__ << " existed inflight ops " << left << dendl;
+      std::unique_lock l{flush_lock};
+      ++flush_waiters;
+      while (inflight_ops.load() > 0) {
+        flush_cond.wait(l);
+      }
+      --flush_waiters;
+    }
   }
 
   void start() {
@@ -519,6 +515,14 @@ void SharedDriverQueueData::_aio_thread()
             delete t;
             ceph_abort();
           }
+          IOContext *ctx = t->ctx;
+          if (ctx->priv) {
+            if (!--ctx->num_running) {
+              t->device->aio_callback(t->device->aio_callback_priv, ctx->priv);
+            }
+          } else {
+            ctx->try_aio_wake();
+          }
           break;
         }
         case IOCommand::READ_COMMAND:
@@ -591,7 +595,7 @@ void SharedDriverQueueData::_aio_thread()
     }
     if (_t) {
       _t->next = nullptr;
-      dout(2) << __func__ << " @@ thread_id=" << queue_id
+      dout(5) << __func__ << " @@ thread_id=" << queue_id
                         << " current_io_queue_depth=" << current_queue_depth
                         << " submit_queue_size=" << q_size
                         << " inflight_ops=" << inflight_ops
@@ -608,6 +612,12 @@ void SharedDriverQueueData::_aio_thread()
 //           flush_cond.notify_all();
 //       }
     if (!t) {
+      if (flush_waiters.load()) {
+        std::lock_guard l(flush_lock);
+        if (inflight_ops.load() == 0) {
+          flush_cond.notify_all();
+        }
+      }
       if (!inflight) {
         // be careful, here we need to let each thread reap its own, currently it is done
         // by only one dedicatd dpdk thread
@@ -875,20 +885,15 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
              << queue->inflight_ops << dendl;
     // check waiting count before doing callback (which may
     // destroy this ioc).
-    if (ctx->priv) {
-//       dout(20) << __func__ << "@@ cb:start" << dendl;
-      if (!--ctx->num_running) {
-        // dout(20) << __func__ << "@@ cb:ctx=" << ctx << " num_running=" << ctx->num_running << dendl;
-        task->device->aio_callback(task->device->aio_callback_priv, ctx->priv);
-      }
-//       dout(20) << __func__ << "@@ cb:done" << dendl;
-    } else {
-//       dout(20) << __func__ << " aio_wake" << dendl;
-      ctx->try_aio_wake();
-    }
+//     if (ctx->priv) {
+//       if (!--ctx->num_running) {
+//         task->device->aio_callback(task->device->aio_callback_priv, ctx->priv);
+//       }
+//     } else {
+//       ctx->try_aio_wake();
+//     }
     task->release_segs(queue);
     delete task;
-//     dout(20) << __func__ << "write done!" << dendl;
   } else if (task->command == IOCommand::READ_COMMAND) {
     ceph_assert(!spdk_nvme_cpl_is_error(completion));
     dout(20) << __func__ << " read op successfully" << dendl;
@@ -1015,11 +1020,11 @@ int NVMEDevice::flush()
   dout(10) << __func__ << " start" << dendl;
 //   auto start = ceph::coarse_real_clock::now();
 
-//   if(queue_id == -1)
-//     queue_id = ceph_gettid();
-//   SharedDriverQueueData *queue = driver->get_queue(queue_id);
-//   assert(queue != NULL);
-//   queue->flush_wait();
+  if(queue_id == -1)
+    queue_id = ceph_gettid();
+  SharedDriverQueueData *queue = driver->get_queue(queue_id);
+  assert(queue != NULL);
+  queue->flush_wait();
 //   auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(
 //       ceph::coarse_real_clock::now() - start);
 //   queue->logger->tinc(l_bluestore_nvmedevice_flush_lat, dur);
