@@ -145,6 +145,7 @@ class SharedDriverQueueData {
     opts.qprio = SPDK_NVME_QPRIO_URGENT;
     // usable queue depth should minus 1 to aovid overflow.
     max_queue_depth = opts.io_queue_size - 1;
+//     max_queue_depth = 64;
     qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, &opts, sizeof(opts));
     ceph_assert(qpair != NULL);
 
@@ -469,6 +470,9 @@ void SharedDriverQueueData::_aio_thread()
 
   Task *t = nullptr;
   int r = 0;
+  bool no_slots = false;
+  bool flushing = false;
+//   bool has_read = false;
   uint64_t lba_off, lba_count;
   uint32_t max_io_completion = (uint32_t)g_conf().get_val<uint64_t>("bluestore_spdk_max_io_completion");
 
@@ -482,15 +486,21 @@ void SharedDriverQueueData::_aio_thread()
       r = spdk_nvme_qpair_process_completions(qpair, max_io_completion);
       if (r < 0) {
         ceph_abort();
+      } else if (no_slots && (r == 0)) {
+        goto again;
+      } else if (flushing && (current_queue_depth > 0)) {
+        goto again;
       }
     }
 
     for (; t; t = t->next) {
-      if (current_queue_depth == max_queue_depth) {
+      if (current_queue_depth >= max_queue_depth) {
         dout(1) << __func__ << " @3 no slots!" << dendl;
         // no slots
+        no_slots = true;
         goto again;
       }
+      no_slots = false;
 
       t->queue = this;
       lba_off = t->offset / block_size;
@@ -523,10 +533,15 @@ void SharedDriverQueueData::_aio_thread()
           } else {
             ctx->try_aio_wake();
           }
+          current_queue_depth++;
           break;
         }
         case IOCommand::READ_COMMAND:
         {
+        //   if (flushing && current_queue_depth != 0) {
+        //     goto again;
+        //   }
+        //   flushing = false;
           dout(20) << __func__ << " read command issued " << lba_off << "~" << lba_count << dendl;
           r = alloc_buf_from_pool(t, false);
           if (r < 0) {
@@ -542,22 +557,32 @@ void SharedDriverQueueData::_aio_thread()
             delete t;
             ceph_abort();
           }
+          current_queue_depth++;
           break;
         }
         case IOCommand::FLUSH_COMMAND:
         {
-          dout(20) << __func__ << " flush command issueed " << dendl;
-          r = spdk_nvme_ns_cmd_flush(ns, qpair, io_complete, t);
-          if (r < 0) {
-            derr << __func__ << " failed to flush: " << cpp_strerror(r) << dendl;
-            t->release_segs(this);
-            delete t;
-            ceph_abort();
+          if (current_queue_depth > 0) {
+            flushing = true;
+            goto again;
           }
+          flushing = false;
+          --inflight_ops;
+          // it will delete task in flush()
+          Task * _t = t;
+          t = t->next;
+          _t->ctx->try_aio_wake();
+          dout(10) << __func__ << " flush op end" << dendl;
+          goto again;
+        //   r = spdk_nvme_ns_cmd_flush(ns, qpair, io_complete, t);
+        //   if (r < 0) {
+        //     derr << __func__ << " failed to flush: " << cpp_strerror(r) << dendl;
+        //     ceph_abort();
+        //   }
           break;
         }
       }
-      current_queue_depth++;
+//       current_queue_depth++;
     }
 //       dout(1) << " @@@1 queue_empty=false" << dendl; 
     std::queue<Task*> q;
@@ -612,12 +637,12 @@ void SharedDriverQueueData::_aio_thread()
 //           flush_cond.notify_all();
 //       }
     if (!t) {
-      if (flush_waiters.load()) {
-        std::lock_guard l(flush_lock);
-        if (inflight_ops.load() == 0) {
-          flush_cond.notify_all();
-        }
-      }
+//       if (flush_waiters.load()) {
+//         std::lock_guard l(flush_lock);
+//         if (inflight_ops.load() == 0) {
+//           flush_cond.notify_all();
+//         }
+//       }
       if (!inflight) {
         // be careful, here we need to let each thread reap its own, currently it is done
         // by only one dedicatd dpdk thread
@@ -922,8 +947,9 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
   } else {
     ceph_assert(task->command == IOCommand::FLUSH_COMMAND);
     ceph_assert(!spdk_nvme_cpl_is_error(completion));
-    dout(20) << __func__ << " flush op successfully" << dendl;
-    task->return_code = 0;
+//     dout(10) << __func__ << " flush op successfully" << dendl;
+//     ctx->try_aio_wake();
+//     task->return_code = 0;
   }
 }
 
@@ -1015,7 +1041,7 @@ int NVMEDevice::collect_metadata(const string& prefix, map<string,string> *pm) c
   return 0;
 }
 
-int NVMEDevice::flush()
+int NVMEDevice::internal_flush()
 {
   dout(10) << __func__ << " start" << dendl;
 //   auto start = ceph::coarse_real_clock::now();
@@ -1174,6 +1200,7 @@ int NVMEDevice::read(uint64_t off, uint64_t len, bufferlist *pbl,
                      IOContext *ioc,
                      bool buffered)
 {
+//   internal_flush();
   dout(5) << __func__ << " " << off << "~" << len << " ioc " << ioc << dendl;
   ceph_assert(is_valid_io(off, len));
 
@@ -1198,7 +1225,8 @@ int NVMEDevice::aio_read(
     bufferlist *pbl,
     IOContext *ioc)
 {
-  dout(20) << __func__ << " " << off << "~" << len << " ioc " << ioc << dendl;
+//   internal_flush();
+  dout(10) << __func__ << " " << off << "~" << len << " ioc " << ioc << dendl;
   ceph_assert(is_valid_io(off, len));
   bufferptr p = buffer::create_small_page_aligned(len);
   pbl->append(p);
@@ -1211,6 +1239,7 @@ int NVMEDevice::aio_read(
 
 int NVMEDevice::read_random(uint64_t off, uint64_t len, char *buf, bool buffered)
 {
+//   internal_flush();
   ceph_assert(len > 0);
   ceph_assert(off < size);
   ceph_assert(off + len <= size);
@@ -1227,6 +1256,22 @@ int NVMEDevice::read_random(uint64_t off, uint64_t len, char *buf, bool buffered
   ioc.aio_wait();
 
   return t.return_code;
+}
+
+int NVMEDevice::flush()
+{
+  dout(10) << __func__ << " start" << dendl;
+
+  Task * t = new Task(this, IOCommand::FLUSH_COMMAND, 0, 0, 1);
+  IOContext ioc(cct, nullptr);
+  t->ctx = &ioc;
+  t->queue = nullptr;
+  ioc_append_task(&ioc, t);
+  aio_submit(&ioc);
+  ioc.aio_wait();
+  delete t;
+  dout(10) << __func__ << " end" << dendl;
+  return 0;
 }
 
 int NVMEDevice::invalidate_cache(uint64_t off, uint64_t len)

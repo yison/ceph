@@ -71,6 +71,7 @@ class NVMEDevice : public BlockDevice {
 		int write_hint = WRITE_LIFE_NOT_SET) override;
   int write(uint64_t off, bufferlist& bl, bool buffered, int write_hint = WRITE_LIFE_NOT_SET) override;
   int flush() override;
+  int internal_flush();
   int read_random(uint64_t off, uint64_t len, char *buf, bool buffered) override;
 
   // for managing buffered readers/writers
