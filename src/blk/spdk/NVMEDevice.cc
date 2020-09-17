@@ -472,7 +472,7 @@ void SharedDriverQueueData::_aio_thread()
   int r = 0;
   bool no_slots = false;
   bool flushing = false;
-//   bool has_read = false;
+  bool w_io_since_flush = false;
   uint64_t lba_off, lba_count;
   uint32_t max_io_completion = (uint32_t)g_conf().get_val<uint64_t>("bluestore_spdk_max_io_completion");
 
@@ -525,6 +525,7 @@ void SharedDriverQueueData::_aio_thread()
             delete t;
             ceph_abort();
           }
+          w_io_since_flush = true;
           IOContext *ctx = t->ctx;
           if (ctx->priv) {
             if (!--ctx->num_running) {
@@ -562,10 +563,13 @@ void SharedDriverQueueData::_aio_thread()
         }
         case IOCommand::FLUSH_COMMAND:
         {
-          if (current_queue_depth > 0) {
-            flushing = true;
-            goto again;
+          if (w_io_since_flush) {
+            if (current_queue_depth > 0) {
+              flushing = true;
+              goto again;
+            }
           }
+          w_io_since_flush = false;
           flushing = false;
           --inflight_ops;
           // it will delete task in flush()
