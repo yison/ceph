@@ -46,6 +46,20 @@ class NVMEDevice : public BlockDevice {
    */
   SharedDriverData *driver;
   string name;
+//   bool aio_stop;
+
+//   struct AioCompletionThread : public Thread {
+//     NVMEDevice *bdev;
+//     explicit AioCompletionThread(NVMEDevice *b) : bdev(b) {}
+//     void *entry() override {
+//       bdev->_aio_thread();
+//       return NULL;
+//     }
+//   } aio_thread;
+
+//   void _aio_thread();
+//   int _aio_start();
+//   void _aio_stop();
 
  public:
   std::atomic_int queue_number = {0};
