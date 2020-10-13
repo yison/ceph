@@ -362,7 +362,13 @@ void SharedDriverData::_aio_thread()
     std::lock_guard guard(queues_lock);
 //     for(std::vector<struct spdk_nvme_qpair*>::iterator it = nvme_qpairs.begin(); it != nvme_qpairs.end(); ++it) {
     for(std::vector<SharedDriverQueueData*>::iterator it = queues.begin(); it != queues.end(); ++it) {
-      std::lock_guard guard((*it)->lock);
+      std::unique_lock _lock((*it)->lock, std::try_to_lock);
+      if (!_lock.owns_lock()) {
+        continue;
+      }
+      if ((*it)->current_queue_depth == 0) {
+        continue;
+      }
       r = spdk_nvme_qpair_process_completions((*it)->qpair, max_io_completion);
       if (r < 0) {
         ceph_abort();
